@@ -325,6 +325,14 @@ String SQLBase::getDolorEngineName() const
     {
         return "rabbitmq";
     }
+    if (isS3QueueEngine())
+    {
+        return "s3queue";
+    }
+    if (isAzureQueueEngine())
+    {
+        return "azurequeue";
+    }
     UNREACHABLE();
 }
 
@@ -555,6 +563,13 @@ void SQLBase::setTablePath(RandomGenerator & rg, const FuzzConfig & fc, const bo
             }
         }
         bucket_path = std::move(next_bucket_path);
+        /// Sometimes dolor writes objects to the path of a queue, broken ones too. It names them from the path,
+        /// so not with a placeholder ClickHouse expands
+        if (has_dolor && isAnyQueueEngine() && integration != IntegrationCall::None && bucket_path->find('{') == String::npos
+            && rg.nextBool())
+        {
+            integration = IntegrationCall::Dolor;
+        }
     }
     else if (isKeeperMapEngine() || isArrowFlightEngine() || isFileEngine() || (isURLEngine() && fc.http_server.has_value()))
     {

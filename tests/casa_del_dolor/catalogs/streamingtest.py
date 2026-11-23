@@ -5,12 +5,14 @@ import json
 import logging
 import random
 import subprocess
+import threading
 import time
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
 
 import pika
+from azure.core.exceptions import ResourceNotFoundError
 from kafka import KafkaAdminClient
 from kafka.admin import ConfigResource, ConfigResourceType, NewPartitions, NewTopic
 from kafka.errors import TopicAlreadyExistsError, UnknownTopicOrPartitionError
@@ -21,7 +23,15 @@ from tests.integration.helpers.cluster import docker_exec, nats_connect_ssl
 import tests.integration.helpers.kafka.common as k
 
 from .datagenerator import LakeDataGenerator, _to_json_safe
-from .filetables import DATA_FILE_FORMATS
+from .filetables import _COMPRESSION_ALIASES, DATA_FILE_FORMATS, _compress_bytes
+
+
+def _encode(message) -> bytes:
+    return message if isinstance(message, bytes) else message.encode()
+
+
+def _random_headers() -> dict:
+    return {f"h{i}": str(random.randint(0, 9)) for i in range(random.randint(1, 3))}
 
 
 def _plain(value):
@@ -141,6 +151,8 @@ class StreamingHandler:
         # Back-reference for the data generator and the data files of the `File` tables
         self.spark = spark_handler
         self.tables: dict[str, StreamingTable] = {}
+        # The HTTP server is threaded, and the handlers keep clients and tables between requests
+        self.lock = threading.Lock()
         self.logger = logging.getLogger(__name__)
         # The settings of the client binary that allow the suspicious and experimental types BuzzHouse creates
         names = subprocess.run(
@@ -240,24 +252,30 @@ class StreamingHandler:
         columns: list,
     ) -> bool:
         table = StreamingTable(topic, group, fmt, columns)
-        self.tables[f"{database_name}.{table_name}"] = table
-        try:
-            self.on_create(table)
-        except Exception as e:
-            # The broker may be restarting, the table is created anyway
-            self.logger.exception(e)
+        with self.lock:
+            self.tables[f"{database_name}.{table_name}"] = table
+            try:
+                self.on_create(table)
+            except Exception as e:
+                # The broker may be restarting, the table is created anyway
+                self.logger.exception(e)
         return True
 
     def update_table(self, database_name: str, table_name: str) -> bool:
-        table = self.tables.get(f"{database_name}.{table_name}")
-        if table is None or random.randint(1, 10) > 8:
-            # Another topic, maybe of another table
-            table = StreamingTable(f"t{random.randint(0, 19)}", "", "CSV", [])
-        try:
-            self.on_update(table)
-        except Exception as e:
-            # If an error happens, ignore it, but log it
-            self.logger.exception(e)
+        with self.lock:
+            table = self.tables.get(f"{database_name}.{table_name}")
+            if table is None or random.randint(1, 10) > 8:
+                # The topic, path or queue of another table
+                table = (
+                    random.choice(list(self.tables.values()))
+                    if self.tables
+                    else StreamingTable(f"t{random.randint(0, 19)}", "", "CSV", [])
+                )
+            try:
+                self.on_update(table)
+            except Exception as e:
+                # If an error happens, ignore it, but log it
+                self.logger.exception(e)
         return True
 
     def on_create(self, table: StreamingTable):
@@ -326,7 +344,7 @@ class KafkaHandler(StreamingHandler):
                 key = f"k{random.randint(0, 9)}".encode() if random.randint(1, 2) == 1 else None
                 headers = None
                 if random.randint(1, 4) == 1:
-                    headers = [(f"h{i}", str(random.randint(0, 9)).encode()) for i in range(random.randint(1, 3))]
+                    headers = [(name, value.encode()) for name, value in _random_headers().items()]
                 timestamp_ms = random.choice([None, None, now_ms, 0, now_ms - 86400000])
                 # A tombstone: a message with a key and without a value
                 value = None if key is not None and random.randint(1, 15) == 1 else message
@@ -380,10 +398,6 @@ class KafkaHandler(StreamingHandler):
             super().on_update(table)
 
 
-def _encode(message) -> bytes:
-    return message if isinstance(message, bytes) else message.encode()
-
-
 class NATSHandler(StreamingHandler):
     """Core NATS subjects need no creation. A table with a group reads from the JetStream stream
     of that name through the durable consumer `c<group>`, both of which this handler creates."""
@@ -411,9 +425,7 @@ class NATSHandler(StreamingHandler):
     def produce(self, table: StreamingTable, messages: list):
         async def publish(nc, _):
             for message in messages:
-                headers = None
-                if random.randint(1, 4) == 1:
-                    headers = {f"h{i}": str(random.randint(0, 9)) for i in range(random.randint(1, 3))}
+                headers = _random_headers() if random.randint(1, 4) == 1 else None
                 await nc.publish(table.topic, _encode(message), headers=headers)
             await nc.flush()
 
@@ -502,14 +514,14 @@ class RabbitMQHandler(StreamingHandler):
                 properties = pika.BasicProperties(
                     message_id=str(uuid.uuid4()) if random.randint(1, 2) == 1 else None,
                     timestamp=int(time.time()) if random.randint(1, 2) == 1 else None,
-                    headers={"h": str(random.randint(0, 9))} if random.randint(1, 4) == 1 else None,
+                    headers=_random_headers() if random.randint(1, 4) == 1 else None,
                     delivery_mode=random.choice([1, 2]),
                 )
                 # Publishing to an exchange that does not exist closes the channel
                 channel.basic_publish(
                     exchange=table.topic,
                     routing_key=random.choice(["", "0", "1", "a"]),
-                    body=message,
+                    body=_encode(message),
                     properties=properties,
                 )
 
@@ -539,5 +551,90 @@ class RabbitMQHandler(StreamingHandler):
         elif next_operation <= 300:
             # Every consumer of every table loses its connection at once
             self._close_all_connections()
+        else:
+            super().on_update(table)
+
+
+class ObjectQueueHandler(StreamingHandler):
+    """Writes objects, broken ones too, where an S3Queue or AzureQueue table reads. The `topic` of the
+    table is its path in the bucket or container, maybe a glob, and its `group` the compression."""
+
+    # Name prefixes that sort before and after each other, so `ordered` mode also sees older names
+    _NAME_PREFIXES = ("0", "5", "a", "m", "z", "~")
+
+    def __init__(self, cluster, spark_handler, is_azure: bool):
+        super().__init__(cluster, spark_handler)
+        self.is_azure = is_azure
+        # The objects written under each path, to overwrite or delete some of them later
+        self.written: dict[str, list[str]] = {}
+
+    def _name(self) -> str:
+        return f"{random.choice(self._NAME_PREFIXES)}{uuid.uuid4().hex[:8]}"
+
+    def _key(self, path: str) -> str:
+        key = path.lstrip("/")
+        while "*" in key:
+            key = key.replace("*", self._name(), 1)
+        if not key or key.endswith("/"):
+            key += self._name()
+        return key
+
+    @staticmethod
+    def _compression(key: str, compression: str) -> str:
+        method = compression.lower()
+        if method == "auto":
+            # ClickHouse picks the method from the extension
+            name = key.rsplit("/", 1)[-1]
+            method = name.rsplit(".", 1)[-1].lower() if "." in name else "none"
+        return _COMPRESSION_ALIASES.get(method, method)
+
+    def _blob(self, key: str):
+        return self.cluster.blob_service_client.get_blob_client(self.cluster.azure_container_name, key)
+
+    def _put(self, key: str, data: bytes):
+        if self.is_azure:
+            self._blob(key).upload_blob(data, overwrite=True)
+        else:
+            self.cluster.minio_client.put_object(
+                self.cluster.minio_bucket, key, io.BytesIO(data), len(data)
+            )
+
+    def _delete(self, key: str):
+        if self.is_azure:
+            try:
+                self._blob(key).delete_blob()
+            except ResourceNotFoundError:
+                # ClickHouse moved or deleted it after processing, MinIO ignores a missing object too
+                pass
+        else:
+            self.cluster.minio_client.remove_object(self.cluster.minio_bucket, key)
+
+    def produce(self, table: StreamingTable, messages: list):
+        written = self.written.setdefault(table.topic, [])
+        for message in messages:
+            # Sometimes overwrite an object that ClickHouse may have processed already
+            key = (
+                random.choice(written)
+                if written and random.randint(1, 10) == 1
+                else self._key(table.topic)
+            )
+            data = _encode(message)
+            try:
+                data = _compress_bytes(data, self._compression(key, table.group))
+            except ValueError:
+                # No Python codec (lz4, brotli) or no compression extension: the object stays as is
+                pass
+            self._put(key, data)
+            if key not in written:
+                written.append(key)
+        del written[:-100]
+
+    def on_update(self, table: StreamingTable):
+        written = self.written.get(table.topic)
+        if written and random.randint(1, 10) == 1:
+            # Delete objects, maybe while ClickHouse processes or moves them
+            for key in random.sample(written, random.randint(1, len(written))):
+                written.remove(key)
+                self._delete(key)
         else:
             super().on_update(table)

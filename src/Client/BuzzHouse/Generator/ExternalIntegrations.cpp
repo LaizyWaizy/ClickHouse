@@ -1595,13 +1595,16 @@ bool DolorIntegration::performTableIntegration(RandomGenerator & rg, SQLTable & 
             escapeJSON(t.getSparkCatalogName()),
             t.isOnS3() ? "s3" : (t.isOnAzure() ? "azure" : "local"));
     }
-    else if (t.isAnyStreamingEngine())
+    else if (t.isAnyStreamingEngine() || t.isAnyQueueEngine())
     {
+        /// For a queue, the path within the bucket or container, and the compression the objects are written with
+        const bool is_queue = t.isAnyQueueEngine();
+
         buf += fmt::format(
             R"(,"engine":"{}","topic":"{}","group":"{}")",
             t.getDolorEngineName(),
-            escapeJSON(t.topic.value()),
-            escapeJSON(t.group.value_or("")));
+            escapeJSON(is_queue ? t.getTablePath() : t.topic.value()),
+            escapeJSON(is_queue ? t.file_comp.value_or("auto") : t.group.value_or("")));
     }
     else if (t.isFileEngine())
     {
@@ -1695,6 +1698,12 @@ void DolorIntegration::setTableEngineDetails(RandomGenerator & rg, const SQLTabl
                      sv->set_value("'" + catalog_url + "'");
                  }});
         }
+    }
+    else if (t.isAnyQueueEngine())
+    {
+        /// The same storage as without dolor, which only writes objects to the path
+        te->add_params()->set_rvalue(
+            t.isS3QueueEngine() ? fc.minio_server.value().named_collection : fc.azurite_server.value().named_collection);
     }
     else if (t.isAnyStreamingEngine())
     {
