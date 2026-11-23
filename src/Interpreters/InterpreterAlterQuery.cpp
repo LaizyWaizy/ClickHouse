@@ -46,6 +46,7 @@
 #include <Storages/StorageFactory.h>
 #include <Storages/PartitionCommands.h>
 #include <Storages/ExecuteCommands.h>
+#include <Storages/StorageAlias.h>
 #include <Storages/StorageKeeperMap.h>
 #include <Storages/ColumnsDescription.h>
 #include <Storages/IStorage.h>
@@ -687,6 +688,10 @@ BlockIO InterpreterAlterQuery::executeToTable(const ASTAlterQuery & alter)
             /// The hosts run the entry without the user, so the row policy is checked here before the entry is enqueued.
             checkNoRowPolicyForExport(captured_alter, default_database, context);
 
+            /// For the same reason, the targets of an `Alias` are authorized here.
+            StorageAlias::checkTargetChainAccessIfAlias(
+                StorageID{default_database, captured_alter.getTable()}, context, AccessType::ALTER, throw_if_unresolved);
+
             /// `throw_if_unresolved` means the hosts do not run the query as this user.
             if (throw_if_unresolved)
                 for (const auto & child : captured_alter.command_list->children)
@@ -726,6 +731,12 @@ BlockIO InterpreterAlterQuery::executeToTable(const ASTAlterQuery & alter)
 
     if (database->shouldReplicateQuery(getContext(), query_ptr))
     {
+        /// The replicas execute the query without the user, unless it is a mutation, so the targets of an `Alias` are authorized here.
+        if (!skip_access_check)
+        {
+            StorageAlias::checkTargetChainAccessIfAlias(table, getContext(), AccessType::ALTER);
+        }
+
         auto guard = DatabaseCatalog::instance().getDDLGuard(table_id.database_name, table_id.table_name, database.get());
         guard->releaseTableLock();
         return database->tryEnqueueReplicatedDDL(query_ptr, getContext(), {.run_as_submitting_user = is_mutation}, std::move(guard));
