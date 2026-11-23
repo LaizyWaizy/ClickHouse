@@ -16,6 +16,7 @@ from azure.core.exceptions import ResourceNotFoundError
 from kafka import KafkaAdminClient
 from kafka.admin import ConfigResource, ConfigResourceType, NewPartitions, NewTopic
 from kafka.errors import TopicAlreadyExistsError, UnknownTopicOrPartitionError
+from minio.commonconfig import Tags
 from nats.js import api
 from pyspark.sql import Row
 
@@ -591,12 +592,22 @@ class ObjectQueueHandler(StreamingHandler):
     def _blob(self, key: str):
         return self.cluster.blob_service_client.get_blob_client(self.cluster.azure_container_name, key)
 
-    def _put(self, key: str, data: bytes):
+    def _outside_key(self, key: str) -> str:
+        # Usually not matched by the path: another extension, one directory deeper, or another prefix
+        head, _, name = key.rpartition("/")
+        deeper = f"{head}/{self._name()}/{name}" if head else f"{self._name()}/{name}"
+        return random.choice([f"{key}.x", deeper, f"x{key}"])
+
+    def _put(self, key: str, data: bytes, tags: dict | None):
         if self.is_azure:
-            self._blob(key).upload_blob(data, overwrite=True)
+            self._blob(key).upload_blob(data, overwrite=True, tags=tags)
         else:
+            object_tags = None
+            if tags:
+                object_tags = Tags(for_object=True)
+                object_tags.update(tags)
             self.cluster.minio_client.put_object(
-                self.cluster.minio_bucket, key, io.BytesIO(data), len(data)
+                self.cluster.minio_bucket, key, io.BytesIO(data), len(data), tags=object_tags
             )
 
     def _delete(self, key: str):
@@ -618,13 +629,21 @@ class ObjectQueueHandler(StreamingHandler):
                 if written and random.randint(1, 10) == 1
                 else self._key(table.topic)
             )
+            if random.randint(1, 20) == 1:
+                key = self._outside_key(key)
             data = _encode(message)
             try:
                 data = _compress_bytes(data, self._compression(key, table.group))
             except ValueError:
                 # No Python codec (lz4, brotli) or no compression extension: the object stays as is
                 pass
-            self._put(key, data)
+            # The tags BuzzHouse sets for `after_processing = 'tag'`, so an object may look processed already
+            tags = (
+                {random.choice(["processed", "fuzz"]): str(random.randint(0, 9))}
+                if random.randint(1, 10) == 1
+                else None
+            )
+            self._put(key, data, tags)
             if key not in written:
                 written.append(key)
         del written[:-100]
@@ -636,5 +655,9 @@ class ObjectQueueHandler(StreamingHandler):
             for key in random.sample(written, random.randint(1, len(written))):
                 written.remove(key)
                 self._delete(key)
+        elif random.randint(1, 100) == 1:
+            # More objects than a listing page of MinIO (1000), from one batch of messages to stay fast
+            messages = self.next_messages(table)
+            self.produce(table, [random.choice(messages) for _ in range(random.randint(1000, 1500))])
         else:
             super().on_update(table)
