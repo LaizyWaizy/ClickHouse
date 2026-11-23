@@ -1,0 +1,13 @@
+-- without grants on the target
+ACCESS_DENIED
+ACCESS_DENIED
+ACCESS_DENIED
+ACCESS_DENIED
+0
+-- with SHOW COLUMNS on the target
+OK
+hidden_name
+salary
+-- a chain of aliases requires every hop
+ACCESS_DENIED
+OK
