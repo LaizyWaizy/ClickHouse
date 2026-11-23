@@ -1184,8 +1184,11 @@ String FuzzConfig::getRandomIcebergHistoryValue(const String & property)
 
 String FuzzConfig::getRandomFileSystemCacheValue()
 {
-    /// Can't use sampling here either
-    return queryFirstLine(R"(SELECT "cache_name" FROM "system"."filesystem_cache_settings" ORDER BY rand() LIMIT 1)", false);
+    /// Can't use sampling here either. Only the distributed cache servers' caches, which require an overcommit policy:
+    /// a disk cache keeps no owners across restarts (FILECACHE_ACCESS_DENIED), and may be too small for temporary data
+    return queryFirstLine(
+        R"(SELECT "cache_name" FROM "system"."filesystem_cache_settings" WHERE "cache_policy" ILIKE '%OVERCOMMIT%' ORDER BY rand() LIMIT 1)",
+        false);
 }
 
 String FuzzConfig::getRandomFuzzedPartName(const uint64_t rand_val)
